@@ -1,5 +1,5 @@
 name = "classifica"
-main = "src/Classifica.js"
+main = "Src/Classifica.js"
 compatibility_date = "2024-04-01"
 
 [[d1_databases]]
