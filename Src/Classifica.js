@@ -2,39 +2,87 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // 1. API: Lista di tutti i campionati (div)
+    // 1. API: Elenco campionati (con bandiere e nazioni da regole_leghe)
     if (url.pathname === '/api/leagues') {
-      const { results } = await env.DB_ARCHIVIO.prepare(
-        'SELECT DISTINCT div FROM matches WHERE div IS NOT NULL ORDER BY div ASC'
-      ).all();
-      return new Response(JSON.stringify(results.map(r => r.div)), {
-        headers: { 'Content-Type': 'application/json' }
-      });
+      try {
+        const { results } = await env.DB_ARCHIVIO.prepare(`
+          SELECT r.div, r.nazione, r.bandiera 
+          FROM regole_leghe r
+          INNER JOIN (SELECT DISTINCT div FROM matches) m ON r.div = m.div
+          ORDER BY r.div ASC
+        `).all();
+
+        return new Response(JSON.stringify(results), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      } catch (err) {
+        // Fallback su sola tabella matches se regole_leghe non risponde
+        const { results } = await env.DB_ARCHIVIO.prepare(
+          'SELECT DISTINCT div FROM matches WHERE div IS NOT NULL ORDER BY div ASC'
+        ).all();
+        return new Response(JSON.stringify(results.map(r => ({ div: r.div }))), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
     }
 
-    // 2. API: Lista stagioni per il campionato selezionato
-    if (url.pathname === '/api/seasons') {
-      const div = url.searchParams.get('div');
-      if (!div) return new Response('[]', { headers: { 'Content-Type': 'application/json' } });
-
-      const { results } = await env.DB_ARCHIVIO.prepare(
-        'SELECT DISTINCT season FROM matches WHERE div = ? ORDER BY season DESC'
-      ).bind(div).all();
-
-      return new Response(JSON.stringify(results.map(r => r.season)), {
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-
-    // 3. API: Calcolo Classifica (Punti, DR, GF)
+    // 2. API: Calcolo Classifica Stagione in Corso
     if (url.pathname === '/api/standings') {
       const div = url.searchParams.get('div');
-      const season = url.searchParams.get('season');
-
-      if (!div || !season) {
-        return new Response(JSON.stringify([]), { headers: { 'Content-Type': 'application/json' } });
+      if (!div) {
+        return new Response(JSON.stringify({ error: 'Div mancante' }), { 
+          status: 400, 
+          headers: { 'Content-Type': 'application/json' } 
+        });
       }
 
+      // Recupera la regola della lega
+      const regola = await env.DB_ARCHIVIO.prepare(
+        'SELECT data_regressione, nazione, bandiera FROM regole_leghe WHERE div = ?'
+      ).bind(div).first();
+
+      // Determina la stagione in corso
+      const now = new Date();
+      const currentYear = now.getUTCFullYear();
+      const currentMonth = now.getUTCMonth() + 1;
+      const currentDay = now.getUTCDate();
+
+      let targetSeason = '';
+
+      if (regola && regola.data_regressione) {
+        const [regM, regD] = regola.data_regressione.split('-').map(Number);
+        const isPastRegression = (currentMonth > regM) || (currentMonth === regM && currentDay >= regD);
+
+        // Se la regressione è estiva (es. 07-20), campionato su due anni
+        if (regM <= 9) {
+          targetSeason = isPastRegression 
+            ? `${currentYear}/${currentYear + 1}` 
+            : `${currentYear - 1}/${currentYear}`;
+        } else {
+          // Campionato annuale (es. Brasile/MLS/Argentina)
+          targetSeason = isPastRegression ? `${currentYear + 1}` : `${currentYear}`;
+        }
+      } else {
+        // Fallback generico su anno solare
+        targetSeason = `${currentYear}`;
+      }
+
+      // Verifica se ci sono partite giocate per la stagione calcolata, altrimenti prende la più recente
+      const checkSeason = await env.DB_ARCHIVIO.prepare(
+        'SELECT season FROM matches WHERE div = ? AND season = ? LIMIT 1'
+      ).bind(div, targetSeason).first();
+
+      let activeSeason = targetSeason;
+      if (!checkSeason) {
+        const latest = await env.DB_ARCHIVIO.prepare(
+          'SELECT season FROM matches WHERE div = ? ORDER BY season DESC LIMIT 1'
+        ).bind(div).first();
+        if (latest) {
+          activeSeason = latest.season;
+        }
+      }
+
+      // Query Classifica con formula matematica garantita (V*3 + N)
       const query = `
         WITH stats AS (
           SELECT 
@@ -44,8 +92,7 @@ export default {
             CASE WHEN fthg = ftag THEN 1 ELSE 0 END AS d,
             CASE WHEN fthg < ftag THEN 1 ELSE 0 END AS l,
             fthg AS gf,
-            ftag AS ga,
-            CASE WHEN fthg > ftag THEN 3 WHEN fthg = ftag THEN 1 ELSE 0 END AS pts
+            ftag AS ga
           FROM matches
           WHERE div = ? AND season = ? AND fthg IS NOT NULL AND ftag IS NOT NULL
           
@@ -58,14 +105,13 @@ export default {
             CASE WHEN ftag = fthg THEN 1 ELSE 0 END AS d,
             CASE WHEN ftag < fthg THEN 1 ELSE 0 END AS l,
             ftag AS gf,
-            fthg AS ga,
-            CASE WHEN ftag > fthg THEN 3 WHEN ftag = ftag THEN 1 ELSE 0 END AS pts
+            fthg AS ga
           FROM matches
           WHERE div = ? AND season = ? AND fthg IS NOT NULL AND ftag IS NOT NULL
         )
         SELECT 
           team,
-          SUM(pts) AS pts,
+          (SUM(w) * 3 + SUM(d)) AS pts,
           SUM(p) AS p,
           SUM(w) AS w,
           SUM(d) AS d,
@@ -79,55 +125,65 @@ export default {
       `;
 
       const { results } = await env.DB_ARCHIVIO.prepare(query)
-        .bind(div, season, div, season)
+        .bind(div, activeSeason, div, activeSeason)
         .all();
 
-      return new Response(JSON.stringify(results), {
+      return new Response(JSON.stringify({
+        div: div,
+        season: activeSeason,
+        bandiera: regola?.bandiera || '',
+        nazione: regola?.nazione || '',
+        standings: results
+      }), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
 
-    // 4. Pagina Web (HTML / CSS / JS)
+    // 3. Pagina Web minimale (Font 10px)
     const html = `<!DOCTYPE html>
 <html lang="it">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Classifica Campionati</title>
+  <title>Classifica</title>
   <style>
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
       font-size: 10px;
-      margin: 12px;
-      background: #fdfdfd;
-      color: #222;
+      margin: 10px;
+      background: #fcfcfc;
+      color: #111;
     }
-    .controls {
+    .header {
       display: flex;
-      gap: 8px;
+      gap: 10px;
       align-items: center;
-      margin-bottom: 12px;
+      margin-bottom: 10px;
     }
     select {
       font-size: 10px;
       padding: 2px 4px;
-      border: 1px solid #ccc;
-      border-radius: 3px;
+      border: 1px solid #bbb;
+      border-radius: 2px;
       background: #fff;
+    }
+    .season-tag {
+      font-weight: bold;
+      color: #444;
     }
     table {
       border-collapse: collapse;
       width: 100%;
-      max-width: 650px;
+      max-width: 600px;
       background: #fff;
     }
     th, td {
-      border: 1px solid #e0e0e0;
-      padding: 3px 6px;
+      border: 1px solid #ddd;
+      padding: 3px 5px;
       text-align: center;
     }
     th {
-      background-color: #f2f2f2;
+      background-color: #f0f0f0;
       font-weight: 600;
     }
     td.team {
@@ -135,91 +191,81 @@ export default {
       font-weight: 500;
     }
     tr:nth-child(even) {
-      background-color: #fafafa;
+      background-color: #f9f9f9;
     }
     .loading {
-      color: #666;
+      color: #777;
       font-style: italic;
     }
   </style>
 </head>
 <body>
 
-  <div class="controls">
-    <label>Campionato: <select id="leagueSelect"><option>Caricamento...</option></select></label>
-    <label>Stagione: <select id="seasonSelect"><option>--</option></select></label>
+  <div class="header">
+    <label>Lega: <select id="leagueSelect"><option>Caricamento...</option></select></label>
+    <span id="seasonDisplay" class="season-tag"></span>
     <span id="status" class="loading"></span>
   </div>
 
   <table>
     <thead>
       <tr>
-        <th style="width: 25px;">#</th>
+        <th style="width: 22px;">#</th>
         <th style="text-align: left;">Squadra</th>
-        <th style="width: 30px;">PT</th>
-        <th style="width: 25px;">G</th>
-        <th style="width: 25px;">V</th>
-        <th style="width: 25px;">N</th>
-        <th style="width: 25px;">P</th>
-        <th style="width: 25px;">GF</th>
-        <th style="width: 25px;">GS</th>
-        <th style="width: 30px;">DR</th>
+        <th style="width: 28px;">PT</th>
+        <th style="width: 22px;">G</th>
+        <th style="width: 22px;">V</th>
+        <th style="width: 22px;">N</th>
+        <th style="width: 22px;">P</th>
+        <th style="width: 24px;">GF</th>
+        <th style="width: 24px;">GS</th>
+        <th style="width: 28px;">DR</th>
       </tr>
     </thead>
     <tbody id="standingsBody">
-      <tr><td colspan="10" style="padding: 10px;">Seleziona un campionato e una stagione</td></tr>
+      <tr><td colspan="10" style="padding: 8px;">Caricamento...</td></tr>
     </tbody>
   </table>
 
   <script>
     const leagueSelect = document.getElementById('leagueSelect');
-    const seasonSelect = document.getElementById('seasonSelect');
+    const seasonDisplay = document.getElementById('seasonDisplay');
     const standingsBody = document.getElementById('standingsBody');
     const status = document.getElementById('status');
 
     async function init() {
       const leagues = await fetch('/api/leagues').then(r => r.json());
-      leagueSelect.innerHTML = leagues.map(l => \`<option value="\${l}">\${l}</option>\`).join('');
+      leagueSelect.innerHTML = leagues.map(l => {
+        const flag = l.bandiera ? l.bandiera + ' ' : '';
+        return \`<option value="\${l.div}">\${flag}\${l.div}</option>\`;
+      }).join('');
 
-      const savedLeague = localStorage.getItem('last_div');
-      const savedSeason = localStorage.getItem('last_season');
-
-      if (savedLeague && leagues.includes(savedLeague)) {
+      const savedLeague = localStorage.getItem('selected_div');
+      if (savedLeague && leagues.some(l => l.div === savedLeague)) {
         leagueSelect.value = savedLeague;
       }
 
-      await loadSeasons(savedSeason);
-    }
-
-    async function loadSeasons(preferredSeason = null) {
-      const div = leagueSelect.value;
-      if (!div) return;
-
-      const seasons = await fetch(\`/api/seasons?div=\${encodeURIComponent(div)}\`).then(r => r.json());
-      seasonSelect.innerHTML = seasons.map(s => \`<option value="\${s}">\${s}</option>\`).join('');
-
-      if (preferredSeason && seasons.includes(preferredSeason)) {
-        seasonSelect.value = preferredSeason;
-      }
-
-      saveAndLoadStandings();
+      loadStandings();
     }
 
     async function loadStandings() {
       const div = leagueSelect.value;
-      const season = seasonSelect.value;
-      if (!div || !season) return;
+      if (!div) return;
 
-      status.textContent = 'Caricamento...';
-      const standings = await fetch(\`/api/standings?div=\${encodeURIComponent(div)}&season=\${encodeURIComponent(season)}\`).then(r => r.json());
+      localStorage.setItem('selected_div', div);
+      status.textContent = 'Aggiornamento...';
+
+      const data = await fetch(\`/api/standings?div=\${encodeURIComponent(div)}\`).then(r => r.json());
       status.textContent = '';
 
-      if (standings.length === 0) {
-        standingsBody.innerHTML = '<tr><td colspan="10">Nessuna partita trovata per questa selezione.</td></tr>';
+      seasonDisplay.textContent = \`Stagione \${data.season}\`;
+
+      if (!data.standings || data.standings.length === 0) {
+        standingsBody.innerHTML = '<tr><td colspan="10" style="padding: 8px;">Nessuna partita registrata.</td></tr>';
         return;
       }
 
-      standingsBody.innerHTML = standings.map((row, index) => \`
+      standingsBody.innerHTML = data.standings.map((row, index) => \`
         <tr>
           <td>\${index + 1}</td>
           <td class="team">\${row.team}</td>
@@ -235,15 +281,7 @@ export default {
       \`).join('');
     }
 
-    function saveAndLoadStandings() {
-      localStorage.setItem('last_div', leagueSelect.value);
-      localStorage.setItem('last_season', seasonSelect.value);
-      loadStandings();
-    }
-
-    leagueSelect.addEventListener('change', () => loadSeasons());
-    seasonSelect.addEventListener('change', saveAndLoadStandings);
-
+    leagueSelect.addEventListener('change', loadStandings);
     init();
   </script>
 </body>
