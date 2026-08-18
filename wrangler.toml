@@ -1,13 +1,8 @@
-{
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "classifica",
-  "main": "src/index.js",
-  "compatibility_date": "2024-04-01",
-  "d1_databases": [
-    {
-      "binding": "DB_ARCHIVIO",
-      "database_name": "archivio_partite",
-      "database_id": "dd9a583d-ee1c-4114-891a-bd44b17ec1e7"
-    }
-  ]
-}
+name = "classifica"
+main = "src/classifica.js"
+compatibility_date = "2024-04-01"
+
+[[d1_databases]]
+binding = "DB_ARCHIVIO"
+database_name = "archivio_partite"
+database_id = "dd9a583d-ee1c-4114-891a-bd44b17ec1e7" 
