@@ -2,7 +2,24 @@ name = "classifica"
 main = "Src/Classifica.js"
 compatibility_date = "2024-04-01"
 
+# 1. Database Archivio Partite & Statistiche
 [[d1_databases]]
 binding = "DB_ARCHIVIO"
 database_name = "archivio_partite"
-database_id = "dd9a583d-ee1c-4114-891a-bd44b17ec1e7" 
+database_id = "dd9a583d-ee1c-4114-891a-bd44b17ec1e7"
+
+# 2. Database Parametri Dixon-Coles (Rho)
+[[d1_databases]]
+binding = "DB_PRONOSTICI"
+database_name = "db_pronostici"
+database_id = "6f393ca6-0ebc-4f37-98db-3df8857222ed"
+
+# 3. Database Output Proiezioni & Motivazioni
+[[d1_databases]]
+binding = "DB_SOGLIE"
+database_name = "db_soglie"
+database_id = "6bde4e75-41f2-40c1-85e7-4abd5a045043"
+
+# Variabile per proteggere l'endpoint del Cron
+[vars]
+CRON_KEY = "segreto_montecarlo_2026" 
