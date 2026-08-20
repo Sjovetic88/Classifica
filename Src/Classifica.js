@@ -43,7 +43,7 @@ function calculateMatchProbabilities(homeTeam, awayTeam, rho) {
 // ==========================================
 function getTournamentPhaseInfo(div) {
   const now = new Date();
-  const curMonth = now.getUTCMonth() + 1; // 1-12
+  const curMonth = now.getUTCMonth() + 1;
   const curYear = now.getUTCFullYear();
 
   // Messico (MEX): Apertura (Lug-Dic) / Clausura (Gen-Giu)
@@ -74,8 +74,8 @@ function getTournamentPhaseInfo(div) {
     isSplit: false,
     phaseName: '',
     singleRound: false,
-    dateStart: '1900-01-01',
-    dateEnd: '2099-12-31'
+    dateStart: '',
+    dateEnd: ''
   };
 }
 
@@ -120,14 +120,20 @@ async function runSimulationForLeague(div, env) {
   const teamMap = new Map();
   eliteTeams.forEach(t => teamMap.set(String(t.team_id), t));
 
-  // 4. Partite disputate
-  const { results: playedMatches } = await env.DB_ARCHIVIO.prepare(`
+  // 4. Query Partite Disputate (Filtro data SOLO per campionati split)
+  let playedMatchesQuery = `
     SELECT home_team_id, away_team_id, fthg, ftag 
     FROM matches 
-    WHERE div = ? AND season = ? 
-      AND date >= ? AND date <= ?
-      AND fthg IS NOT NULL AND ftag IS NOT NULL
-  `).bind(div, activeSeason, phaseInfo.dateStart, phaseInfo.dateEnd).all();
+    WHERE div = ? AND season = ? AND fthg IS NOT NULL AND ftag IS NOT NULL
+  `;
+  let queryParams = [div, activeSeason];
+
+  if (phaseInfo.isSplit) {
+    playedMatchesQuery += ` AND date >= ? AND date <= ?`;
+    queryParams.push(phaseInfo.dateStart, phaseInfo.dateEnd);
+  }
+
+  const { results: playedMatches } = await env.DB_ARCHIVIO.prepare(playedMatchesQuery).bind(...queryParams).all();
 
   const uniqueTeamsInSeason = new Set();
   playedMatches.forEach(m => {
@@ -135,8 +141,18 @@ async function runSimulationForLeague(div, env) {
     if (m.away_team_id) uniqueTeamsInSeason.add(String(m.away_team_id));
   });
 
+  // Controllo completamento 1ª giornata
   if (regola.num_squadre && uniqueTeamsInSeason.size < regola.num_squadre) {
-    return { status: 'saltato', div, motivo: `Squadre attive insufficienti (${uniqueTeamsInSeason.size}/${regola.num_squadre})` };
+    const updateDate = new Date().toISOString();
+    // Aggiorna il timestamp di controllo per sbloccare la rotazione
+    await env.DB_SOGLIE.prepare(`
+      INSERT INTO proiezioni_campionato 
+        (div, season, team_id, team_name, punti_attuali, punti_proiettati, prob_titolo, prob_ucl, prob_uel, prob_uecl, prob_promo, prob_playoff, prob_playout, prob_retro, fattore_motivazione, data_aggiornamento)
+      VALUES (?, ?, 'STATUS_PENDING', 'NON_DISPONIBILE', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1.0, ?)
+      ON CONFLICT(div, season, team_id) DO UPDATE SET data_aggiornamento = excluded.data_aggiornamento
+    `).bind(div, activeSeason, updateDate).run();
+
+    return { status: 'non_disponibile', div, motivo: `In attesa del debutto di tutte le squadre (${uniqueTeamsInSeason.size}/${regola.num_squadre})` };
   }
 
   // 5. Calcolo classifica reale
@@ -158,7 +174,7 @@ async function runSimulationForLeague(div, env) {
     }
   });
 
-  // 6. GENERAZIONE DINAMICA PARTITE RESTANTI (Supporto a 1, 2, 3 e 4 Gironi)
+  // 6. Generazione Partite Restanti
   const numGironi = phaseInfo.singleRound ? 1 : (Number(regola.num_gironi) || 2);
   const playedDirectedCount = new Map();
 
@@ -171,9 +187,7 @@ async function runSimulationForLeague(div, env) {
   const teamsArr = Array.from(uniqueTeamsInSeason);
 
   if (numGironi % 2 === 0) {
-    // Numero di gironi PARI (es. 2 gironi standard = 1 match in casa a testa; 4 gironi Irlanda = 2 match in casa a testa)
     const targetHomeMatches = numGironi / 2;
-
     for (let i = 0; i < teamsArr.length; i++) {
       for (let j = 0; j < teamsArr.length; j++) {
         if (i !== j) {
@@ -195,7 +209,6 @@ async function runSimulationForLeague(div, env) {
       }
     }
   } else {
-    // Numero di gironi DISPARI (es. 1 girone Apertura/Clausura o 3 gironi Scozia)
     for (let i = 0; i < teamsArr.length; i++) {
       for (let j = i + 1; j < teamsArr.length; j++) {
         const t1 = teamsArr[i];
@@ -207,10 +220,8 @@ async function runSimulationForLeague(div, env) {
 
         if (needed > 0) {
           for (let k = 0; k < needed; k++) {
-            // Assegna il fattore campo a chi ha giocato meno partite in casa
             const hId = (played1Home <= played2Home) ? t1 : t2;
             const aId = (hId === t1) ? t2 : t1;
-
             const hTeam = teamMap.get(hId) || { attacco: 1.0, difesa: 1.0, h_factor: 25 };
             const aTeam = teamMap.get(aId) || { attacco: 1.0, difesa: 1.0, h_factor: 25 };
             const probs = calculateMatchProbabilities(hTeam, aTeam, rho);
@@ -221,7 +232,7 @@ async function runSimulationForLeague(div, env) {
     }
   }
 
-  // 7. Simulazione Monte Carlo (2.500 Iterazioni)
+  // 7. Monte Carlo (2.500 Iterazioni)
   const ITERATIONS = 2500;
   const simResults = {};
   teamsArr.forEach(id => {
@@ -263,7 +274,7 @@ async function runSimulationForLeague(div, env) {
       if (pos === 0) simResults[id].title++;
       if (uclEnd > 0 && pos < uclEnd) simResults[id].ucl++;
       if (uelEnd > uclEnd && pos >= uclEnd && pos < uelEnd) simResults[id].uel++;
-      if (ueclEnd > uelEnd && pos >= uclEnd && pos < ueclEnd) simResults[id].uecl++;
+      if (ueclEnd > uelEnd && pos >= uelEnd && pos < ueclEnd) simResults[id].uecl++;
       if (promoEnd > 0 && pos < promoEnd) simResults[id].promo++;
       if (playoffEnd > promoEnd && pos >= promoEnd && pos < playoffEnd) simResults[id].playoff++;
       if (retroCount > 0 && pos >= (N - retroCount)) simResults[id].retro++;
@@ -271,12 +282,15 @@ async function runSimulationForLeague(div, env) {
     }
   }
 
-  // 8. Calcolo Motivazione
+  // 8. Calcolo Motivazione e Salvataggio
   const avgPlayed = playedMatches.length / (teamsArr.length / 2);
   const totalRounds = Number(regola.giornate_totali) || ((teamsArr.length - 1) * numGironi);
   const progressRatio = Math.min(1.0, avgPlayed / totalRounds);
   const updateDate = new Date().toISOString();
   const statements = [];
+
+  // Pulisce eventuale record di stato temporaneo
+  statements.push(env.DB_SOGLIE.prepare('DELETE FROM proiezioni_campionato WHERE div = ? AND season = ? AND team_id = "STATUS_PENDING"').bind(div, activeSeason));
 
   for (let i = 0; i < teamsArr.length; i++) {
     const id = teamsArr[i];
@@ -408,7 +422,7 @@ export default {
     }
 
     // -------------------------------------------------------------
-    // 2. API: Lista Leghe Attive
+    // 2. API: Lista Leghe Attive (Dropdown)
     // -------------------------------------------------------------
     if (url.pathname === '/api/leagues') {
       const { results } = await env.DB_ARCHIVIO.prepare(`
@@ -419,7 +433,9 @@ export default {
         ORDER BY r.div ASC
       `).all();
 
-      return new Response(JSON.stringify(results), { headers: { 'Content-Type': 'application/json' } });
+      return new Response(JSON.stringify(results), { 
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store, no-cache, must-revalidate' } 
+      });
     }
 
     // -------------------------------------------------------------
@@ -447,24 +463,40 @@ export default {
 
       const phaseInfo = getTournamentPhaseInfo(div);
 
-      // Classifica Reale filtrata per data
-      const queryReale = `
+      // Classifica Reale (Filtro data solo per split)
+      let queryReale = `
         WITH stats AS (
           SELECT hometeam AS team, 1 AS p, CASE WHEN fthg > ftag THEN 1 ELSE 0 END AS w, CASE WHEN fthg = ftag THEN 1 ELSE 0 END AS d, CASE WHEN fthg < ftag THEN 1 ELSE 0 END AS l, fthg AS gf, ftag AS ga 
           FROM matches 
-          WHERE div = ? AND season = ? AND date >= ? AND date <= ? AND fthg IS NOT NULL AND ftag IS NOT NULL
+          WHERE div = ? AND season = ? AND fthg IS NOT NULL AND ftag IS NOT NULL
+      `;
+      let paramsReale = [div, activeSeason];
+
+      if (phaseInfo.isSplit) {
+        queryReale += ` AND date >= ? AND date <= ? `;
+        paramsReale.push(phaseInfo.dateStart, phaseInfo.dateEnd);
+      }
+
+      queryReale += `
           UNION ALL
           SELECT awayteam AS team, 1 AS p, CASE WHEN ftag > fthg THEN 1 ELSE 0 END AS w, CASE WHEN ftag = fthg THEN 1 ELSE 0 END AS d, CASE WHEN ftag < fthg THEN 1 ELSE 0 END AS l, ftag AS gf, fthg AS ga 
           FROM matches 
-          WHERE div = ? AND season = ? AND date >= ? AND date <= ? AND fthg IS NOT NULL AND ftag IS NOT NULL
+          WHERE div = ? AND season = ? AND fthg IS NOT NULL AND ftag IS NOT NULL
+      `;
+      paramsReale.push(div, activeSeason);
+
+      if (phaseInfo.isSplit) {
+        queryReale += ` AND date >= ? AND date <= ? `;
+        paramsReale.push(phaseInfo.dateStart, phaseInfo.dateEnd);
+      }
+
+      queryReale += `
         )
         SELECT team, (SUM(w) * 3 + SUM(d)) AS pts, SUM(p) AS p, SUM(w) AS w, SUM(d) AS d, SUM(l) AS l, SUM(gf) AS gf, SUM(ga) AS ga, (SUM(gf) - SUM(ga)) AS gd
         FROM stats GROUP BY team ORDER BY pts DESC, gd DESC, gf DESC, team ASC;
       `;
-      const { results: reale } = await env.DB_ARCHIVIO.prepare(queryReale).bind(
-        div, activeSeason, phaseInfo.dateStart, phaseInfo.dateEnd,
-        div, activeSeason, phaseInfo.dateStart, phaseInfo.dateEnd
-      ).all();
+
+      const { results: reale } = await env.DB_ARCHIVIO.prepare(queryReale).bind(...paramsReale).all();
 
       // Classifica Proiettata da DB_SOGLIE
       let proiezioni = [];
@@ -472,7 +504,7 @@ export default {
         const { results: proj } = await env.DB_SOGLIE.prepare(
           'SELECT * FROM proiezioni_campionato WHERE div = ? AND season = ? ORDER BY punti_proiettati DESC'
         ).bind(div, activeSeason).all();
-        proiezioni = proj;
+        proiezioni = proj.filter(r => r.team_id !== 'STATUS_PENDING');
       } catch (e) {}
 
       return new Response(JSON.stringify({
@@ -483,7 +515,9 @@ export default {
         nazione: regola?.nazione || '',
         reale,
         proiezioni
-      }), { headers: { 'Content-Type': 'application/json' } });
+      }), { 
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store, no-cache, must-revalidate' } 
+      });
     }
 
     // -------------------------------------------------------------
@@ -622,7 +656,7 @@ export default {
     const status = document.getElementById('status');
 
     async function init() {
-      const leagues = await fetch('/api/leagues').then(r => r.json());
+      const leagues = await fetch('/api/leagues', { cache: 'no-store' }).then(r => r.json());
       leagueSelect.innerHTML = leagues.map(l => {
         const flag = l.bandiera ? l.bandiera + ' ' : '';
         return \`<option value="\${l.div}">\${flag}\${l.div}</option>\`;
@@ -641,7 +675,7 @@ export default {
       localStorage.setItem('selected_div', div);
       status.textContent = 'Caricamento...';
 
-      const data = await fetch(\`/api/data?div=\${encodeURIComponent(div)}\`).then(r => r.json());
+      const data = await fetch(\`/api/data?div=\${encodeURIComponent(div)}&_=\${Date.now()}\`, { cache: 'no-store' }).then(r => r.json());
       status.textContent = '';
       
       const faseTxt = data.fase ? \` - \${data.fase}\` : '';
@@ -669,7 +703,7 @@ export default {
 
       // Render Proiezioni Monte Carlo
       if (!data.proiezioni || data.proiezioni.length === 0) {
-        projBody.innerHTML = '<tr><td colspan="13" style="padding:8px;">Simulazione Monte Carlo non ancora eseguita.</td></tr>';
+        projBody.innerHTML = '<tr><td colspan="13" style="padding:8px; color:#666;">Proiezioni non disponibili: in attesa che tutte le squadre disputino la 1ª giornata.</td></tr>';
         updateTag.textContent = '';
       } else {
         updateTag.textContent = 'Aggiornato: ' + new Date(data.proiezioni[0].data_aggiornamento).toLocaleString('it-IT');
