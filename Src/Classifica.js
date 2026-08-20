@@ -41,7 +41,7 @@ function calculateMatchProbabilities(homeTeam, awayTeam, rho) {
 // ==========================================
 // RILEVAMENTO FINESTRA APERTURA / CLAUSURA
 // ==========================================
-function getTournamentPhaseInfo(div, activeSeason) {
+function getTournamentPhaseInfo(div) {
   const now = new Date();
   const curMonth = now.getUTCMonth() + 1; // 1-12
   const curYear = now.getUTCFullYear();
@@ -70,7 +70,6 @@ function getTournamentPhaseInfo(div, activeSeason) {
     };
   }
 
-  // Campionati Standard
   return {
     isSplit: false,
     phaseName: '',
@@ -110,8 +109,7 @@ async function runSimulationForLeague(div, env) {
     return { status: 'saltato', div, motivo: 'Nessuna partita registrata nel database' };
   }
 
-  // Finestra temporale (per Apertura / Clausura)
-  const phaseInfo = getTournamentPhaseInfo(div, activeSeason);
+  const phaseInfo = getTournamentPhaseInfo(div);
 
   // 2. Lettura Parametro Rho (Dixon-Coles)
   const rhoRow = await env.DB_PRONOSTICI.prepare('SELECT current_rho FROM parametri_campionato WHERE campionato = ?').bind(div).first();
@@ -122,7 +120,7 @@ async function runSimulationForLeague(div, env) {
   const teamMap = new Map();
   eliteTeams.forEach(t => teamMap.set(String(t.team_id), t));
 
-  // 4. Partite disputate nella fase attiva
+  // 4. Partite disputate
   const { results: playedMatches } = await env.DB_ARCHIVIO.prepare(`
     SELECT home_team_id, away_team_id, fthg, ftag 
     FROM matches 
@@ -141,7 +139,7 @@ async function runSimulationForLeague(div, env) {
     return { status: 'saltato', div, motivo: `Squadre attive insufficienti (${uniqueTeamsInSeason.size}/${regola.num_squadre})` };
   }
 
-  // 5. Calcolo classifica reale della fase
+  // 5. Calcolo classifica reale
   const currentStats = {};
   uniqueTeamsInSeason.forEach(id => {
     currentStats[id] = { pts: 0, p: 0, w: 0, d: 0, l: 0, gf: 0, ga: 0 };
@@ -160,47 +158,70 @@ async function runSimulationForLeague(div, env) {
     }
   });
 
-  // 6. Generazione partite restanti (Sottrazione per girone singolo o doppio)
+  // 6. GENERAZIONE DINAMICA PARTITE RESTANTI (Supporto a 1, 2, 3 e 4 Gironi)
+  const numGironi = phaseInfo.singleRound ? 1 : (Number(regola.num_gironi) || 2);
+  const playedDirectedCount = new Map();
+
+  playedMatches.forEach(m => {
+    const key = `${m.home_team_id}_${m.away_team_id}`;
+    playedDirectedCount.set(key, (playedDirectedCount.get(key) || 0) + 1);
+  });
+
   const remainingMatches = [];
   const teamsArr = Array.from(uniqueTeamsInSeason);
 
-  if (phaseInfo.singleRound) {
-    // Girone Singolo (Apertura/Clausura): ogni coppia si incontra 1 sola volta
-    const playedUndirected = new Set(playedMatches.map(m => {
-      const p = [m.home_team_id, m.away_team_id].sort();
-      return `${p[0]}_${p[1]}`;
-    }));
+  if (numGironi % 2 === 0) {
+    // Numero di gironi PARI (es. 2 gironi standard = 1 match in casa a testa; 4 gironi Irlanda = 2 match in casa a testa)
+    const targetHomeMatches = numGironi / 2;
 
     for (let i = 0; i < teamsArr.length; i++) {
-      for (let j = i + 1; j < teamsArr.length; j++) {
-        const pairKey = [teamsArr[i], teamsArr[j]].sort().join('_');
-        if (!playedUndirected.has(pairKey)) {
-          const hTeam = teamMap.get(teamsArr[i]) || { attacco: 1.0, difesa: 1.0, h_factor: 25 };
-          const aTeam = teamMap.get(teamsArr[j]) || { attacco: 1.0, difesa: 1.0, h_factor: 25 };
-          const probs = calculateMatchProbabilities(hTeam, aTeam, rho);
-          remainingMatches.push({ h: teamsArr[i], a: teamsArr[j], probs });
+      for (let j = 0; j < teamsArr.length; j++) {
+        if (i !== j) {
+          const hId = teamsArr[i];
+          const aId = teamsArr[j];
+          const key = `${hId}_${aId}`;
+          const played = playedDirectedCount.get(key) || 0;
+          const needed = targetHomeMatches - played;
+
+          if (needed > 0) {
+            const hTeam = teamMap.get(hId) || { attacco: 1.0, difesa: 1.0, h_factor: 25 };
+            const aTeam = teamMap.get(aId) || { attacco: 1.0, difesa: 1.0, h_factor: 25 };
+            const probs = calculateMatchProbabilities(hTeam, aTeam, rho);
+            for (let k = 0; k < needed; k++) {
+              remainingMatches.push({ h: hId, a: aId, probs });
+            }
+          }
         }
       }
     }
   } else {
-    // Doppio Girone Classico (Andata e Ritorno)
-    const playedDirected = new Set(playedMatches.map(m => `${m.home_team_id}_${m.away_team_id}`));
+    // Numero di gironi DISPARI (es. 1 girone Apertura/Clausura o 3 gironi Scozia)
     for (let i = 0; i < teamsArr.length; i++) {
-      for (let j = 0; j < teamsArr.length; j++) {
-        if (i !== j) {
-          const pairKey = `${teamsArr[i]}_${teamsArr[j]}`;
-          if (!playedDirected.has(pairKey)) {
-            const hTeam = teamMap.get(teamsArr[i]) || { attacco: 1.0, difesa: 1.0, h_factor: 25 };
-            const aTeam = teamMap.get(teamsArr[j]) || { attacco: 1.0, difesa: 1.0, h_factor: 25 };
+      for (let j = i + 1; j < teamsArr.length; j++) {
+        const t1 = teamsArr[i];
+        const t2 = teamsArr[j];
+        const played1Home = playedDirectedCount.get(`${t1}_${t2}`) || 0;
+        const played2Home = playedDirectedCount.get(`${t2}_${t1}`) || 0;
+        const totalPlayed = played1Home + played2Home;
+        const needed = numGironi - totalPlayed;
+
+        if (needed > 0) {
+          for (let k = 0; k < needed; k++) {
+            // Assegna il fattore campo a chi ha giocato meno partite in casa
+            const hId = (played1Home <= played2Home) ? t1 : t2;
+            const aId = (hId === t1) ? t2 : t1;
+
+            const hTeam = teamMap.get(hId) || { attacco: 1.0, difesa: 1.0, h_factor: 25 };
+            const aTeam = teamMap.get(aId) || { attacco: 1.0, difesa: 1.0, h_factor: 25 };
             const probs = calculateMatchProbabilities(hTeam, aTeam, rho);
-            remainingMatches.push({ h: teamsArr[i], a: teamsArr[j], probs });
+            remainingMatches.push({ h: hId, a: aId, probs });
           }
         }
       }
     }
   }
 
-  // 7. Monte Carlo (2.500 Iterazioni)
+  // 7. Simulazione Monte Carlo (2.500 Iterazioni)
   const ITERATIONS = 2500;
   const simResults = {};
   teamsArr.forEach(id => {
@@ -252,7 +273,7 @@ async function runSimulationForLeague(div, env) {
 
   // 8. Calcolo Motivazione
   const avgPlayed = playedMatches.length / (teamsArr.length / 2);
-  const totalRounds = phaseInfo.singleRound ? (teamsArr.length - 1) : (regola.giornate_totali || ((teamsArr.length - 1) * 2));
+  const totalRounds = Number(regola.giornate_totali) || ((teamsArr.length - 1) * numGironi);
   const progressRatio = Math.min(1.0, avgPlayed / totalRounds);
   const updateDate = new Date().toISOString();
   const statements = [];
@@ -317,7 +338,7 @@ async function runSimulationForLeague(div, env) {
   }
 
   await env.DB_SOGLIE.batch(statements);
-  return { status: 'completato', div, season: activeSeason, fase: phaseInfo.phaseName, partite_simulate: remainingMatches.length };
+  return { status: 'completato', div, season: activeSeason, fase: phaseInfo.phaseName, num_gironi: numGironi, partite_simulate: remainingMatches.length };
 }
 
 // ==========================================
@@ -387,7 +408,7 @@ export default {
     }
 
     // -------------------------------------------------------------
-    // 2. API: Lista Leghe Attive (Dropdown)
+    // 2. API: Lista Leghe Attive
     // -------------------------------------------------------------
     if (url.pathname === '/api/leagues') {
       const { results } = await env.DB_ARCHIVIO.prepare(`
@@ -424,7 +445,7 @@ export default {
       const checkSeason = await env.DB_ARCHIVIO.prepare('SELECT season FROM matches WHERE div = ? AND season = ? LIMIT 1').bind(div, targetSeason).first();
       let activeSeason = checkSeason ? targetSeason : (await env.DB_ARCHIVIO.prepare('SELECT season FROM matches WHERE div = ? ORDER BY season DESC LIMIT 1').bind(div).first())?.season;
 
-      const phaseInfo = getTournamentPhaseInfo(div, activeSeason);
+      const phaseInfo = getTournamentPhaseInfo(div);
 
       // Classifica Reale filtrata per data
       const queryReale = `
@@ -466,7 +487,7 @@ export default {
     }
 
     // -------------------------------------------------------------
-    // 4. Pagina Web (Font 10px, Due Tabelle)
+    // 4. Pagina Web (Font 10px, Due Tabelle Sovrapposte)
     // -------------------------------------------------------------
     const html = `<!DOCTYPE html>
 <html lang="it">
