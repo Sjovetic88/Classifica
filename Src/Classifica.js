@@ -1,4 +1,6 @@
-// Funzioni matematiche Dixon-Coles
+// ==========================================
+// FUNZIONI MATEMATICHE DIXON-COLES
+// ==========================================
 function factorial(n) {
   if (n <= 1) return 1;
   let res = 1;
@@ -36,12 +38,16 @@ function calculateMatchProbabilities(homeTeam, awayTeam, rho) {
   return { pHome: pHome / total, pDraw: pDraw / total, pAway: pAway / total };
 }
 
-// Funzione core di simulazione
+// ==========================================
+// CORE SIMULATORE MONTE CARLO PER SINGOLA LEGA
+// ==========================================
 async function runSimulationForLeague(div, env) {
   const regola = await env.DB_ARCHIVIO.prepare('SELECT * FROM regole_leghe WHERE div = ?').bind(div).first();
-  if (!regola) throw new Error(`Lega ${div} non trovata in regole_leghe`);
+  if (!regola) {
+    return { status: 'saltato', div, motivo: 'Regole non trovate per la lega' };
+  }
 
-  // 1. Calcolo stagione in corso
+  // 1. Calcolo stagione in corso tramite data_regressione
   const now = new Date();
   const curYear = now.getUTCFullYear();
   const curMonth = now.getUTCMonth() + 1;
@@ -55,20 +61,23 @@ async function runSimulationForLeague(div, env) {
   }
 
   const checkSeason = await env.DB_ARCHIVIO.prepare('SELECT season FROM matches WHERE div = ? AND season = ? LIMIT 1').bind(div, targetSeason).first();
-  const activeSeason = checkSeason ? targetSeason : (await env.DB_ARCHIVIO.prepare('SELECT season FROM matches WHERE div = ? ORDER BY season DESC LIMIT 1').bind(div).first())?.season;
+  const latestSeason = (await env.DB_ARCHIVIO.prepare('SELECT season FROM matches WHERE div = ? ORDER BY season DESC LIMIT 1').bind(div).first())?.season;
+  const activeSeason = checkSeason ? targetSeason : latestSeason;
 
-  if (!activeSeason) throw new Error(`Nessuna stagione disponibile per ${div}`);
+  if (!activeSeason) {
+    return { status: 'saltato', div, motivo: 'Nessuna partita registrata nel database' };
+  }
 
-  // 2. Lettura parametro Rho
+  // 2. Lettura Parametro Rho (Dixon-Coles)
   const rhoRow = await env.DB_PRONOSTICI.prepare('SELECT current_rho FROM parametri_campionato WHERE campionato = ?').bind(div).first();
   const rho = rhoRow ? rhoRow.current_rho : -0.10;
 
-  // 3. Squadre e statistiche
+  // 3. Squadre e rating (Classifica Elite per team_id)
   const { results: eliteTeams } = await env.DB_ARCHIVIO.prepare('SELECT team_id, nome_display, attacco, difesa, h_factor, elo_perf FROM classifica_elite WHERE ultima_div = ?').bind(div).all();
   const teamMap = new Map();
   eliteTeams.forEach(t => teamMap.set(String(t.team_id), t));
 
-  // 4. Partite giocate
+  // 4. Partite disputate
   const { results: playedMatches } = await env.DB_ARCHIVIO.prepare(
     'SELECT home_team_id, away_team_id, fthg, ftag FROM matches WHERE div = ? AND season = ? AND fthg IS NOT NULL AND ftag IS NOT NULL'
   ).bind(div, activeSeason).all();
@@ -79,11 +88,12 @@ async function runSimulationForLeague(div, env) {
     if (m.away_team_id) uniqueTeamsInSeason.add(String(m.away_team_id));
   });
 
+  // Se non tutte le squadre hanno debuttato
   if (regola.num_squadre && uniqueTeamsInSeason.size < regola.num_squadre) {
-    return { status: 'non_disponibile', div, reason: 'Tutte le squadre non hanno ancora disputato almeno 1 incontro' };
+    return { status: 'saltato', div, motivo: `Squadre attive insufficienti (${uniqueTeamsInSeason.size}/${regola.num_squadre})` };
   }
 
-  // 5. Calcolo classifica parziale
+  // 5. Calcolo classifica reale
   const currentStats = {};
   uniqueTeamsInSeason.forEach(id => {
     currentStats[id] = { pts: 0, p: 0, w: 0, d: 0, l: 0, gf: 0, ga: 0 };
@@ -102,7 +112,7 @@ async function runSimulationForLeague(div, env) {
     }
   });
 
-  // 6. Generazione partite restanti
+  // 6. Generazione partite restanti (Round-Robin Subtraction)
   const playedPairs = new Set(playedMatches.map(m => `${m.home_team_id}_${m.away_team_id}`));
   const remainingMatches = [];
   const teamsArr = Array.from(uniqueTeamsInSeason);
@@ -121,7 +131,7 @@ async function runSimulationForLeague(div, env) {
     }
   }
 
-  // 7. Monte Carlo (2.500 Iterazioni)
+  // 7. Simulazione Monte Carlo (2.500 Iterazioni)
   const ITERATIONS = 2500;
   const simResults = {};
   teamsArr.forEach(id => {
@@ -171,7 +181,7 @@ async function runSimulationForLeague(div, env) {
     }
   }
 
-  // 8. Calcolo Motivazione e Salvataggio in DB_SOGLIE
+  // 8. Calcolo Motivazione (Curva di attivazione)
   const avgPlayed = playedMatches.length / (teamsArr.length / 2);
   const totalRounds = regola.giornate_totali || ((teamsArr.length - 1) * 2);
   const progressRatio = Math.min(1.0, avgPlayed / totalRounds);
@@ -241,26 +251,40 @@ async function runSimulationForLeague(div, env) {
   return { status: 'completato', div, season: activeSeason, partite_simulate: remainingMatches.length };
 }
 
+// ==========================================
+// WORKER ROUTER & INTERFACCIA
+// ==========================================
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
     // -------------------------------------------------------------
-    // 1. ENDPOINT CRON A ROTAZIONE AUTOMATICA (Singolo URL)
+    // 1. ENDPOINT CRON A ROTAZIONE (Solo campionati attivi)
     // -------------------------------------------------------------
     if (url.pathname === '/api/cron/simulate-next') {
       const key = url.searchParams.get('key');
       const cronKey = env.CRON_KEY || 'segreto_montecarlo_2026';
 
       if (key !== cronKey) {
-        return new Response(JSON.stringify({ error: 'Non autorizzato' }), { status: 401 });
+        return new Response(JSON.stringify({ error: 'Non autorizzato' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
       }
 
-      // Trova il campionato aggiornato da più tempo (o mai aggiornato)
-      const allDivs = await env.DB_ARCHIVIO.prepare('SELECT DISTINCT div FROM regole_leghe ORDER BY div ASC').all();
-      const leagueList = allDivs.results.map(r => r.div);
+      // Estrae SOLO i campionati con is_active = 1
+      const activeDivsResult = await env.DB_ARCHIVIO.prepare(`
+        SELECT r.div 
+        FROM regole_leghe r
+        INNER JOIN leagues l ON r.div = l.id
+        WHERE l.is_active = 1
+        ORDER BY r.div ASC
+      `).all();
 
-      let chosenDiv = leagueList[0];
+      const activeLeagueList = activeDivsResult.results.map(r => r.div);
+
+      if (activeLeagueList.length === 0) {
+        return new Response(JSON.stringify({ status: 'saltato', motivo: 'Nessun campionato attivo con is_active = 1' }), { headers: { 'Content-Type': 'application/json' } });
+      }
+
+      let chosenDiv = activeLeagueList[0];
       try {
         const oldest = await env.DB_SOGLIE.prepare(`
           SELECT div, MAX(data_aggiornamento) as last_up 
@@ -269,36 +293,46 @@ export default {
           ORDER BY last_up ASC
         `).all();
 
-        const updatedSet = new Set(oldest.results.map(r => r.div));
-        // Se c'è un campionato mai simulato, dai la precedenza a quello
-        const neverSimulated = leagueList.find(d => !updatedSet.has(d));
+        const updatedMap = new Map(oldest.results.map(r => [r.div, r.last_up]));
+        const neverSimulated = activeLeagueList.find(d => !updatedMap.has(d));
+
         if (neverSimulated) {
           chosenDiv = neverSimulated;
-        } else if (oldest.results.length > 0) {
-          chosenDiv = oldest.results[0].div;
+        } else {
+          // Seleziona il campionato attivo con il timestamp più vecchio
+          const sortedActive = activeLeagueList.slice().sort((a, b) => {
+            const timeA = new Date(updatedMap.get(a) || 0).getTime();
+            const timeB = new Date(updatedMap.get(b) || 0).getTime();
+            return timeA - timeB;
+          });
+          chosenDiv = sortedActive[0];
         }
-      } catch (err) {
-        // Se la tabella è vuota, parte dal primo
-      }
+      } catch (err) {}
 
       try {
         const result = await runSimulationForLeague(chosenDiv, env);
         return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });
       } catch (err) {
-        return new Response(JSON.stringify({ error: err.message, div: chosenDiv }), { status: 500 });
+        // Ritorna sempre 200 OK per evitare il blocco di cron-job.org
+        return new Response(JSON.stringify({ status: 'errore_gestito', div: chosenDiv, errore: err.message }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
       }
     }
 
     // -------------------------------------------------------------
-    // 2. API: Lista Leghe
+    // 2. API: Lista Leghe Attive (Dropdown)
     // -------------------------------------------------------------
     if (url.pathname === '/api/leagues') {
       const { results } = await env.DB_ARCHIVIO.prepare(`
         SELECT r.div, r.nazione, r.bandiera 
         FROM regole_leghe r
-        INNER JOIN (SELECT DISTINCT div FROM matches) m ON r.div = m.div
+        INNER JOIN leagues l ON r.div = l.id
+        WHERE l.is_active = 1
         ORDER BY r.div ASC
       `).all();
+
       return new Response(JSON.stringify(results), { headers: { 'Content-Type': 'application/json' } });
     }
 
@@ -325,7 +359,7 @@ export default {
       const checkSeason = await env.DB_ARCHIVIO.prepare('SELECT season FROM matches WHERE div = ? AND season = ? LIMIT 1').bind(div, targetSeason).first();
       let activeSeason = checkSeason ? targetSeason : (await env.DB_ARCHIVIO.prepare('SELECT season FROM matches WHERE div = ? ORDER BY season DESC LIMIT 1').bind(div).first())?.season;
 
-      // Classifica Reale
+      // Classifica Reale con calcolo matematico certo (V*3 + N)
       const queryReale = `
         WITH stats AS (
           SELECT hometeam AS team, 1 AS p, CASE WHEN fthg > ftag THEN 1 ELSE 0 END AS w, CASE WHEN fthg = ftag THEN 1 ELSE 0 END AS d, CASE WHEN fthg < ftag THEN 1 ELSE 0 END AS l, fthg AS gf, ftag AS ga FROM matches WHERE div = ? AND season = ? AND fthg IS NOT NULL AND ftag IS NOT NULL
@@ -337,7 +371,7 @@ export default {
       `;
       const { results: reale } = await env.DB_ARCHIVIO.prepare(queryReale).bind(div, activeSeason, div, activeSeason).all();
 
-      // Classifica Proiettata
+      // Classifica Proiettata da DB_SOGLIE
       let proiezioni = [];
       try {
         const { results: proj } = await env.DB_SOGLIE.prepare(
@@ -357,7 +391,7 @@ export default {
     }
 
     // -------------------------------------------------------------
-    // 4. Pagina Web Minimale (Font 10px)
+    // 4. Pagina Web Minimale (Font 10px, Due Tabelle Sovrapposte)
     // -------------------------------------------------------------
     const html = `<!DOCTYPE html>
 <html lang="it">
@@ -515,7 +549,7 @@ export default {
       status.textContent = '';
       seasonDisplay.textContent = \`Stagione \${data.season}\`;
 
-      // Render Reale
+      // Render Classifica Reale
       if (!data.reale || data.reale.length === 0) {
         realeBody.innerHTML = '<tr><td colspan="10">Nessuna partita registrata.</td></tr>';
       } else {
@@ -535,7 +569,7 @@ export default {
         \`).join('');
       }
 
-      // Render Proiezioni
+      // Render Proiezioni Monte Carlo
       if (!data.proiezioni || data.proiezioni.length === 0) {
         projBody.innerHTML = '<tr><td colspan="13" style="padding:8px;">Simulazione Monte Carlo non ancora eseguita.</td></tr>';
         updateTag.textContent = '';
